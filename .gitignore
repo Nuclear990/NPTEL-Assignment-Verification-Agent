@@ -1,0 +1,13 @@
+venv/
+.env
+
+browser_profile/
+
+credentials.json
+token.json
+
+data/
+screenshots/
+
+__pycache__/
+*.pyc

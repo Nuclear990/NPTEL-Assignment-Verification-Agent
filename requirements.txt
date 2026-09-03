@@ -1,0 +1,8 @@
+playwright
+youtube-transcript-api
+openai
+python-dotenv
+tenacity
+google-api-python-client
+google-auth-httplib2
+google-auth-oauthlib
