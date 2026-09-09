@@ -4,6 +4,7 @@ from pathlib import Path
 from youtube_transcript_api import YouTubeTranscriptApi
 
 from config import DATA_DIR
+from rag.pipeline import receive_transcript_job
 
 
 # ============================================================
@@ -227,22 +228,24 @@ def fetch_week_transcripts(job: dict) -> list:
 
 
 # ============================================================
-# SAVE WEEK TRANSCRIPT
+# SAVE WEEK TRANSCRIPTS
 # ============================================================
 
-def save_week_transcript(
+def save_week_transcripts(
     job: dict,
     lecture_transcripts: list
 ) -> Path:
     """
-    Combine all lecture transcripts into one file.
+    Save each lecture transcript as its own file inside a week folder.
 
     File structure:
 
     data/
         transcripts/
             governance_of_artificial_intelligence/
-                week_2.txt
+                week_2/
+                    01_introduction.txt
+                    02_case_studies.txt
     """
 
     course = job.get(
@@ -257,60 +260,24 @@ def save_week_transcript(
 
     course_slug = slugify(course)
 
-    course_dir = (
+    week_dir = (
         TRANSCRIPTS_DIR
         / course_slug
+        / f"week_{week}"
     )
 
-    course_dir.mkdir(
+    week_dir.mkdir(
         parents=True,
         exist_ok=True
     )
 
-    transcript_path = (
-        course_dir
-        / f"week_{week}.txt"
-    )
-
     print("\n" + "=" * 80)
-    print("SAVING WEEK TRANSCRIPT")
+    print("SAVING WEEK TRANSCRIPTS")
     print("=" * 80)
 
     print(
-        f"File:\n{transcript_path}"
+        f"Folder:\n{week_dir}"
     )
-
-    # ========================================================
-    # BUILD FILE CONTENT
-    # ========================================================
-
-    content_parts = []
-
-    # --------------------------------------------------------
-    # Metadata header
-    # --------------------------------------------------------
-
-    content_parts.append(
-        "=" * 80
-    )
-
-    content_parts.append(
-        f"COURSE: {course}"
-    )
-
-    content_parts.append(
-        f"WEEK: {week}"
-    )
-
-    content_parts.append(
-        "=" * 80
-    )
-
-    content_parts.append("")
-
-    # --------------------------------------------------------
-    # Lecture transcripts
-    # --------------------------------------------------------
 
     for index, item in enumerate(
         lecture_transcripts,
@@ -322,68 +289,76 @@ def save_week_transcript(
             f"Lecture {index}"
         )
 
-        content_parts.append(
-            "=" * 80
+        lecture_slug = (
+            slugify(title)
+            or f"lecture_{index}"
         )
 
-        content_parts.append(
-            f"LECTURE {index}: {title}"
+        lecture_path = (
+            week_dir
+            / f"{index:02d}_{lecture_slug}.txt"
         )
-
-        content_parts.append(
-            "=" * 80
-        )
-
-        content_parts.append("")
 
         if "transcript" in item:
 
-            content_parts.append(
-                item["transcript"]
-            )
+            content = item["transcript"]
 
         else:
 
-            content_parts.append(
-                "[TRANSCRIPT UNAVAILABLE]"
-            )
-
-            content_parts.append("")
-
-            content_parts.append(
+            content = (
+                "[TRANSCRIPT UNAVAILABLE]\n\n"
                 f"Error: "
                 f"{item.get('error', 'Unknown error')}"
             )
 
-        content_parts.append("")
-        content_parts.append("")
+        with open(
+            lecture_path,
+            "w",
+            encoding="utf-8"
+        ) as f:
 
-    # ========================================================
-    # WRITE FILE
-    # ========================================================
+            f.write(content)
 
-    final_content = "\n".join(
-        content_parts
-    )
-
-    with open(
-        transcript_path,
-        "w",
-        encoding="utf-8"
-    ) as f:
-
-        f.write(final_content)
+        print(
+            f"  Saved: {lecture_path.name} "
+            f"({len(content)} chars)"
+        )
 
     print(
-        "\nTranscript file saved successfully."
+        "\nAll lecture transcripts saved."
     )
+
+    return week_dir
+
+
+# ============================================================
+# HAND OFF TO RAG INGESTION
+# ============================================================
+
+def send_to_rag_ingestion(
+    job: dict,
+    transcript_folder: Path
+) -> dict:
+    """
+    Build the RAG ingestion job payload and pass it to
+    rag.pipeline.receive_transcript_job().
+    """
+
+    payload = {
+        "course": job.get("course"),
+        "week": job.get("week"),
+        "folder_path": str(transcript_folder)
+    }
+
+    print("\n" + "=" * 80)
+    print("HANDING OFF TO RAG INGESTION")
+    print("=" * 80)
 
     print(
-        f"Characters written: "
-        f"{len(final_content)}"
+        f"Payload: {payload}"
     )
 
-    return transcript_path
+    return receive_transcript_job(payload)
 
 
 # ============================================================
@@ -397,9 +372,10 @@ def enrich_job_with_transcript_file(
     Full transcript pipeline for one job.
 
     1. Fetch transcripts
-    2. Combine into one week file
-    3. Add transcript_file path to job
-    4. Remove temporary video/lecture data
+    2. Save one file per lecture inside a week folder
+    3. Hand the week off to the RAG ingestion pipeline
+    4. Add transcript_folder path to job
+    5. Remove temporary video/lecture data
     """
 
     print("\n" + "#" * 80)
@@ -423,10 +399,10 @@ def enrich_job_with_transcript_file(
     )
 
     # --------------------------------------------------------
-    # Save combined transcript
+    # Save one file per lecture
     # --------------------------------------------------------
 
-    transcript_path = save_week_transcript(
+    transcript_folder = save_week_transcripts(
         job,
         lecture_transcripts
     )
@@ -450,8 +426,8 @@ def enrich_job_with_transcript_file(
     # Enrich job with lightweight reference
     # --------------------------------------------------------
 
-    job["transcript_file"] = str(
-        transcript_path
+    job["transcript_folder"] = str(
+        transcript_folder
     )
 
     job["transcript_summary"] = {
@@ -461,6 +437,27 @@ def enrich_job_with_transcript_file(
         "transcripts_found": successful,
         "transcripts_failed": failed
     }
+
+    # --------------------------------------------------------
+    # Hand off to RAG ingestion pipeline
+    # --------------------------------------------------------
+
+    try:
+
+        job["rag_ingestion"] = send_to_rag_ingestion(
+            job,
+            transcript_folder
+        )
+
+    except Exception as e:
+
+        print("\nRAG INGESTION FAILED")
+
+        print(
+            f"{type(e).__name__}: {e}"
+        )
+
+        job["rag_ingestion_error"] = str(e)
 
     # --------------------------------------------------------
     # REMOVE HEAVY / TEMPORARY VIDEO DATA
@@ -484,8 +481,8 @@ def enrich_job_with_transcript_file(
     print("=" * 80)
 
     print(
-        f"Transcript file: "
-        f"{job['transcript_file']}"
+        f"Transcript folder: "
+        f"{job['transcript_folder']}"
     )
 
     print(

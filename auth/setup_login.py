@@ -10,7 +10,7 @@ NPTEL_URL = (
 )
 
 
-def main():
+def setup_login():
 
     print("Starting persistent browser...")
 
@@ -65,4 +65,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    setup_login()

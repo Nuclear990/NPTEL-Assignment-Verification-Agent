@@ -1,11 +1,12 @@
 import json
 
-from gmail_watcher import get_recent_nptel_emails
-from email_parser import parse_nptel_email
-from nptel import enrich_jobs_with_videos
-from transcripts import enrich_jobs_with_transcript_files
-from assignment import enrich_jobs_with_assignments
-from solver import solve_jobs
+from ingestion.gmail_watcher import get_recent_nptel_emails
+from ingestion.email_parser import parse_nptel_email
+from ingestion.videos import enrich_jobs_with_videos
+from ingestion.transcripts import enrich_jobs_with_transcript_files
+from ingestion.assignment import enrich_jobs_with_assignments
+from auth.setup_login import setup_login
+#from solver import solve_jobs
 
 # ================================================================
 # CONFIG
@@ -202,7 +203,8 @@ def main():
         )
 
         return
-
+        
+    setup_login()
     # ------------------------------------------------------------
     # NPTEL content extraction
     # ------------------------------------------------------------
@@ -225,14 +227,14 @@ def main():
 
     jobs = process_assignments(
     	jobs
-	)
+    )
 	# ------------------------------------------------------------
 	# Solve assignments
 	# ------------------------------------------------------------
 
-    jobs = process_solutions(
+    '''jobs = process_solutions(
 	 jobs
-    )
+    )'''
 
     # ------------------------------------------------------------
     # FINAL OUTPUT

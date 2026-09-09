@@ -6,6 +6,8 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
+from config import CREDENTIALS_FILE, TOKEN_FILE
+
 
 # ============================================================
 # CONFIGURATION
@@ -14,9 +16,6 @@ from googleapiclient.discovery import build
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly"
 ]
-
-CREDENTIALS_FILE = "credentials.json"
-TOKEN_FILE = "token.json"
 
 
 # ============================================================
