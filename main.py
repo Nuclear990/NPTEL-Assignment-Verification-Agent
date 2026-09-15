@@ -1,18 +1,61 @@
 import json
 
+from playwright.sync_api import sync_playwright
+
+from config import BROWSER_PROFILE_DIR, HEADLESS
 from ingestion.gmail_watcher import get_recent_nptel_emails
 from ingestion.email_parser import parse_nptel_email
-from ingestion.videos import enrich_jobs_with_videos
-from ingestion.transcripts import enrich_jobs_with_transcript_files
-from ingestion.assignment import enrich_jobs_with_assignments
-from auth.setup_login import setup_login
-#from solver import solve_jobs
+from ingestion.videos import get_page, enrich_job_with_videos
+from ingestion.transcripts import (
+    clean_week_transcripts,
+    fetch_week_transcripts,
+    is_fetch_blocked,
+    save_week_transcripts
+)
+from ingestion.assignment import ensure_assignment_scraped
+from jobs import ensure_job, find_job, load_jobs
+from auth.setup_login import NotLoggedInError, setup_login
+#from solver import solve_job
 
 # ================================================================
 # CONFIG
 # ================================================================
 
 MAX_EMAIL_RESULTS = 15
+
+
+# ================================================================
+# CROSS-JOB BROWSER BLOCKING
+# ================================================================
+#
+# NPTEL browser steps (video/transcript scrape, assignment scrape)
+# only run while the login is positively verified. If setup_login
+# can't verify it, or a scrape lands on NPTEL's logged-out view
+# mid-run, every remaining browser step this run is skipped — a
+# logged-out session only ever sees the public preview page, so
+# each attempt would fail (or persist wrong lecture counts).
+#
+
+_browser_blocked = False
+
+
+def is_browser_blocked() -> bool:
+
+    return _browser_blocked
+
+
+def _block_browser(reason: str) -> None:
+
+    global _browser_blocked
+
+    if not _browser_blocked:
+
+        print(
+            f"\n🚫 Skipping NPTEL browser steps for the rest of "
+            f"this run: {reason}"
+        )
+
+    _browser_blocked = True
 
 
 # ================================================================
@@ -39,16 +82,19 @@ def fetch_emails():
 
 # ================================================================
 # STEP 2
-# PARSE EMAILS
+# PARSE EMAILS -> REGISTER NEW JOBS ONLY
 # ================================================================
 
-def parse_emails(emails):
+def register_new_jobs(emails):
+    """
+    Parse every fetched email and persist a jobs.json record for
+    it. Jobs already known (same course + week) are left exactly
+    as they are — this only adds jobs, it never resets progress.
+    """
 
     print("\n" + "=" * 80)
     print("STEP 2: PARSING NPTEL EMAILS")
     print("=" * 80)
-
-    jobs = []
 
     for index, email in enumerate(
         emails,
@@ -72,21 +118,6 @@ def parse_emails(emails):
                 email["body"]
             )
 
-            # Preserve source Gmail ID
-            job["email_id"] = email["id"]
-
-            jobs.append(job)
-
-            print("\n✓ PARSED")
-
-            print(
-                f"Course: {job['course']}"
-            )
-
-            print(
-                f"Week: {job['week']}"
-            )
-
         except Exception as e:
 
             print(
@@ -94,74 +125,274 @@ def parse_emails(emails):
                 f"{type(e).__name__}: {e}"
             )
 
-    print(
-        f"\nValid jobs created: {len(jobs)}"
-    )
+            continue
 
-    return jobs
+        ensure_job(
+            job["course"],
+            job["week"],
+            content_url=job.get("content_url"),
+            assignment_url=job.get("assignment_url"),
+            email_id=email["id"]
+        )
+
+        print("\n✓ PARSED")
+
+        print(
+            f"Course: {job['course']}"
+        )
+
+        print(
+            f"Week: {job['week']}"
+        )
 
 
 # ================================================================
 # STEP 3
-# EXTRACT NPTEL LECTURES + VIDEOS
+# PROCESS ONE JOB END TO END
+#
+# fetch remaining transcripts -> clean remaining transcripts
+#   -> if fully cleaned: embed + store, then solve
 # ================================================================
 
-def process_course_content(jobs):
+def process_job(job_record):
 
-    print("\n" + "=" * 80)
-    print("STEP 3: EXTRACTING COURSE VIDEOS")
-    print("=" * 80)
+    course = job_record["course"]
+    week = job_record["week"]
 
-    return enrich_jobs_with_videos(
-        jobs
+    print("\n" + "#" * 80)
+
+    print(
+        f"JOB: {course} — Week {week}"
     )
 
+    print("#" * 80)
 
-# ================================================================
-# STEP 4
-# FETCH + SAVE TRANSCRIPTS
-# ================================================================
+    if job_record.get("completed"):
 
-def process_transcripts(jobs):
+        print(
+            "\nAlready completed — skipping."
+        )
 
-    print("\n" + "=" * 80)
-    print("STEP 4: FETCHING TRANSCRIPTS")
-    print("=" * 80)
+        return
 
-    return enrich_jobs_with_transcript_files(
-        jobs
+    # --------------------------------------------------------
+    # Step A: fetch remaining transcripts (best effort).
+    #
+    # Own persistent browser context, opened and closed just
+    # for this step — same one-context-per-operation pattern
+    # as auth/setup_login.py and ingestion/assignment.py's
+    # launch_browser(), so this never overlaps with the
+    # separate context the assignment step below opens on the
+    # same browser profile.
+    #
+    # Deliberately does NOT clean — cleaning always happens in
+    # step B below, once, regardless of whether fetching ran,
+    # was skipped, or failed partway.
+    # --------------------------------------------------------
+
+    content_url = job_record.get("contentUrl")
+
+    already_fully_fetched = (
+        job_record["numberOfLectures"] > 0
+        and len(job_record["transcriptsFetched"])
+            >= job_record["numberOfLectures"]
     )
 
+    if already_fully_fetched:
 
-# ================================================================
-# STEP 5
-# EXTRACT + SAVE ASSIGNMENTS
-# ================================================================
+        print(
+            "\nAll lectures already fetched for this week — "
+            "nothing remaining, skipping the video/transcript "
+            "scrape entirely."
+        )
 
-def process_assignments(jobs):
+    elif not content_url:
 
-    print("\n" + "=" * 80)
-    print("STEP 5: PROCESSING ASSIGNMENTS")
-    print("=" * 80)
+        print(
+            "\nNo content URL on record for this job — "
+            "cannot fetch transcripts until a fresh email "
+            "supplies one. Skipping the scrape."
+        )
 
-    return enrich_jobs_with_assignments(
-        jobs
+    elif is_browser_blocked():
+
+        print(
+            "\nNPTEL login not verified this run — "
+            "skipping the scrape."
+        )
+
+    elif is_fetch_blocked():
+
+        print(
+            "\nTranscript fetching is blocked for the rest of "
+            "this run (a prior job hit a systemic failure) — "
+            "skipping the scrape."
+        )
+
+    else:
+
+        try:
+
+            with sync_playwright() as p:
+
+                context = (
+                    p.chromium.launch_persistent_context(
+                        user_data_dir=str(
+                            BROWSER_PROFILE_DIR
+                        ),
+                        headless=HEADLESS,
+                        viewport={
+                            "width": 1400,
+                            "height": 900
+                        }
+                    )
+                )
+
+                try:
+
+                    page = get_page(context)
+
+                    working_job = {
+                        "course": course,
+                        "week": week,
+                        "content_url": content_url
+                    }
+
+                    enrich_job_with_videos(
+                        page,
+                        working_job
+                    )
+
+                    lecture_transcripts = fetch_week_transcripts(
+                        working_job
+                    )
+
+                    save_week_transcripts(
+                        working_job,
+                        lecture_transcripts
+                    )
+
+                finally:
+
+                    context.close()
+
+        except NotLoggedInError as e:
+
+            _block_browser(str(e))
+
+        except Exception as e:
+
+            print("\n" + "!" * 80)
+            print("TRANSCRIPT STEP FAILED")
+            print("!" * 80)
+
+            print(
+                f"{type(e).__name__}: {e}"
+            )
+
+    # --------------------------------------------------------
+    # Step B: clean whatever's fetched but not cleaned yet —
+    # always attempted, whatever step A did or didn't do, so a
+    # lecture fetched in a previous (or this) run never sits
+    # uncleaned just because this run's fetch was skipped/failed.
+    # --------------------------------------------------------
+
+    try:
+
+        clean_week_transcripts(
+            course,
+            week
+        )
+
+    except Exception as e:
+
+        print("\n" + "!" * 80)
+        print("CLEANING STEP FAILED")
+        print("!" * 80)
+
+        print(
+            f"{type(e).__name__}: {e}"
+        )
+
+    # Reload persisted state — the steps above have been
+    # updating jobs.json as they went.
+
+    job_record = find_job(
+        load_jobs(),
+        course,
+        week
     )
-    
-# ================================================================
-# STEP 6
-# SOLVE ASSIGNMENTS
-# ================================================================
 
-def process_solutions(jobs):
+    # --------------------------------------------------------
+    # Assignment (scrape once, skipped if already on disk)
+    # --------------------------------------------------------
 
-    print("\n" + "=" * 80)
-    print("STEP 6: SOLVING ASSIGNMENTS")
-    print("=" * 80)
+    if is_browser_blocked():
 
-    return solve_jobs(
-        jobs
+        print(
+            "\nNPTEL login not verified this run — "
+            "skipping the assignment scrape."
+        )
+
+    else:
+
+        try:
+
+            ensure_assignment_scraped(
+                course,
+                week,
+                job_record.get("assignmentUrl")
+            )
+
+        except NotLoggedInError as e:
+
+            _block_browser(str(e))
+
+        except Exception as e:
+
+            print("\n" + "!" * 80)
+            print("ASSIGNMENT STEP FAILED")
+            print("!" * 80)
+
+            print(
+                f"{type(e).__name__}: {e}"
+            )
+
+    # --------------------------------------------------------
+    # Solving — gated on every lecture for this week being
+    # cleaned. Embedding + storage already happened above, as
+    # part of the transcript-cleaning hand-off (see
+    # rag/indexing/index.py's receive_transcript_job) — main.py
+    # doesn't need to know that exists, only whether cleaning is
+    # complete enough to solve from.
+    # --------------------------------------------------------
+
+    fully_cleaned = (
+        job_record["numberOfLectures"] > 0
+        and len(job_record["transcriptsCleaned"])
+            >= job_record["numberOfLectures"]
     )
+
+    if not fully_cleaned:
+
+        print(
+            "\nTranscripts not fully cleaned yet for this "
+            "week — skipping solving for now."
+        )
+
+        return
+
+    print(
+        "\nAll transcripts cleaned for this week — ready to solve."
+    )
+
+    # TODO: no solver module yet (main.py used to import
+    # `solve_jobs` from one that was never written). Once it
+    # exists, call it here and then mark_completed(course, week).
+    print(
+        "Solver not implemented yet — skipping."
+    )
+
 
 # ================================================================
 # MAIN PIPELINE
@@ -175,66 +406,86 @@ def main():
     print("#" * 80)
 
     # ------------------------------------------------------------
-    # Gmail
+    # Gmail -> register any new jobs
     # ------------------------------------------------------------
 
-    emails = fetch_emails()
+    try:
 
-    if not emails:
+        emails = fetch_emails()
+
+    except Exception as e:
 
         print(
-            "\nNo NPTEL announcement emails found."
+            f"\n✗ EMAIL FETCH FAILED: "
+            f"{type(e).__name__}: {e}"
         )
 
-        return
+        emails = []
 
-    # ------------------------------------------------------------
-    # Email parsing
-    # ------------------------------------------------------------
+    if emails:
 
-    jobs = parse_emails(
-        emails
-    )
+        register_new_jobs(emails)
+
+    else:
+
+        print(
+            "\nNo NPTEL announcement emails found this run — "
+            "continuing with existing tracked jobs."
+        )
+
+    jobs = load_jobs()
 
     if not jobs:
 
         print(
-            "\nNo valid jobs could be created."
+            "\nNo jobs to process."
         )
 
         return
-        
-    setup_login()
-    # ------------------------------------------------------------
-    # NPTEL content extraction
-    # ------------------------------------------------------------
-
-    jobs = process_course_content(
-        jobs
-    )
 
     # ------------------------------------------------------------
-    # Transcript extraction
+    # Process every tracked job
     # ------------------------------------------------------------
 
-    jobs = process_transcripts(
-        jobs
-    )
+    # Browser steps need a positively verified login; cleaning and
+    # indexing of already-fetched transcripts don't, so the run
+    # continues either way.
+    try:
 
-    # ------------------------------------------------------------
-    # Assignment processing
-    # ------------------------------------------------------------
+        setup_login()
 
-    jobs = process_assignments(
-    	jobs
-    )
-	# ------------------------------------------------------------
-	# Solve assignments
-	# ------------------------------------------------------------
+    except Exception as e:
 
-    '''jobs = process_solutions(
-	 jobs
-    )'''
+        _block_browser(
+            f"NPTEL login not verified: "
+            f"{type(e).__name__}: {e}"
+        )
+
+    for job_record in jobs:
+
+        try:
+
+            process_job(
+                job_record
+            )
+
+        except Exception as e:
+
+            print("\n" + "!" * 80)
+            print("JOB FAILED")
+            print("!" * 80)
+
+            print(
+                f"Course: {job_record.get('course')}"
+            )
+
+            print(
+                f"Week: {job_record.get('week')}"
+            )
+
+            print(
+                f"{type(e).__name__}: {e}"
+            )
 
     # ------------------------------------------------------------
     # FINAL OUTPUT
@@ -245,16 +496,15 @@ def main():
     print("PIPELINE COMPLETE")
     print("=" * 80)
 
-    print("\nFINAL JOBS:")
+    print("\nTRACKED JOBS:")
 
     print(
         json.dumps(
-            jobs,
+            load_jobs(),
             indent=4,
             ensure_ascii=False
         )
     )
-
 
 
 # ================================================================

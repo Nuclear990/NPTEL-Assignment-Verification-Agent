@@ -1,6 +1,7 @@
 import os
 import base64
 
+from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -34,12 +35,20 @@ def get_gmail_service():
 
     if not creds or not creds.valid:
 
+        refreshed = False
+
         if creds and creds.expired and creds.refresh_token:
 
             print("Refreshing Gmail credentials...")
-            creds.refresh(Request())
 
-        else:
+            try:
+                creds.refresh(Request())
+                refreshed = True
+
+            except RefreshError:
+                print("Gmail token refresh failed (expired or revoked). Re-authenticating...")
+
+        if not refreshed:
 
             print("Opening Google login...")
 

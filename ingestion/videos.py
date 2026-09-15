@@ -2,7 +2,8 @@ import re
 
 from playwright.sync_api import sync_playwright
 
-from config import BROWSER_PROFILE_DIR
+from auth.setup_login import NotLoggedInError, assert_logged_in
+from config import BROWSER_PROFILE_DIR, HEADLESS
 
 
 # ============================================================
@@ -36,7 +37,7 @@ def get_week_lecture_titles(page, week):
     print("=" * 80)
 
     week_pattern = re.compile(
-        rf"^Week {week}\b",
+        rf"^\s*Week {week}\b",
         re.IGNORECASE
     )
 
@@ -91,7 +92,7 @@ def get_week_lecture_titles(page, week):
             f"Week {week} has no aria-controls"
         )
 
-    print(f"\nWeek container ID:")
+    print("\nWeek container ID:")
     print(container_id)
 
     week_container = page.locator(
@@ -140,25 +141,27 @@ def get_week_lecture_titles(page, week):
 
         print(f"\n[{i}] {text}")
 
-        # Skip non-lecture content
+        # Feedback forms are video-less lesson pages that some courses
+        # list before the quiz, so the assignment stop in
+        # enrich_job_with_videos can't catch them. Week items carry no
+        # type marker in the DOM, hence the (deliberately narrow) title
+        # match; everything else is kept.
         if re.search(
-            r"\bquiz\b|\bassignment\b|\bfeedback\b",
+            r"^\s*Week\s*\d+\s*Feedback Form",
             text,
             re.IGNORECASE
         ):
 
-            print("    -> SKIPPED")
+            print("    -> SKIPPED (feedback form)")
 
             continue
-
-        print("    -> LECTURE")
 
         lecture_titles.append(text)
 
     if not lecture_titles:
 
         raise RuntimeError(
-            f"No lectures found for Week {week}"
+            f"No content items found for Week {week}"
         )
 
     return lecture_titles
@@ -171,7 +174,7 @@ def get_week_lecture_titles(page, week):
 def get_lecture_url(page, week, lecture_title):
 
     week_pattern = re.compile(
-        rf"^Week {week}\b",
+        rf"^\s*Week {week}\b",
         re.IGNORECASE
     )
 
@@ -214,9 +217,13 @@ def get_lecture_url(page, week, lecture_title):
         f"#{container_id}"
     )
 
-    # Exact lecture match
+    # Exact lecture match.
+    # NPTEL's own markup occasionally has stray leading/trailing
+    # whitespace inside the title element (e.g. "Ocean Engineering "),
+    # which survives into has_text's raw text content even though
+    # inner_text() elsewhere normalizes it away. Tolerate it here.
     lecture_pattern = re.compile(
-        rf"^{re.escape(lecture_title)}$"
+        rf"^\s*{re.escape(lecture_title)}\s*$"
     )
 
     lecture_buttons = (
@@ -225,7 +232,17 @@ def get_lecture_url(page, week, lecture_title):
         .filter(has_text=lecture_pattern)
     )
 
-    if lecture_buttons.count() == 0:
+    # The lecture list can render progressively after the week
+    # is expanded, so actively wait for the button to appear
+    # instead of checking count() once after a fixed sleep.
+    try:
+
+        lecture_buttons.first.wait_for(
+            state="visible",
+            timeout=8000
+        )
+
+    except Exception:
 
         raise RuntimeError(
             f"Could not find lecture: "
@@ -295,7 +312,8 @@ def extract_youtube_video(page, lecture_url):
             )
 
             youtube_iframes = page.locator(
-                'iframe[src*="youtube.com/embed"]'
+                'iframe[src*="youtube.com/embed"], '
+                'iframe[src*="youtube-nocookie.com/embed"]'
             )
 
             iframe_count = youtube_iframes.count()
@@ -327,7 +345,7 @@ def extract_youtube_video(page, lecture_url):
                 print(embed_url)
 
                 match = re.search(
-                    r"youtube\.com/embed/([^?&#/]+)",
+                    r"youtube(?:-nocookie)?\.com/embed/([^?&#/]+)",
                     embed_url
                 )
 
@@ -435,6 +453,8 @@ def enrich_job_with_videos(page, job):
 
     page.wait_for_timeout(3000)
 
+    assert_logged_in(page)
+
     # --------------------------------------------------------
     # Get lecture titles
     # --------------------------------------------------------
@@ -492,6 +512,8 @@ def enrich_job_with_videos(page, job):
 
             page.wait_for_timeout(2000)
 
+            assert_logged_in(page)
+
             # --------------------------------------------
             # Get lecture URL
             # --------------------------------------------
@@ -504,6 +526,17 @@ def enrich_job_with_videos(page, job):
 
             print("\nLecture URL:")
             print(lecture_url)
+
+            # The assignment always follows a week's lectures, so the
+            # first item that opens it ends the lecture list.
+            if "assessmentId=" in lecture_url:
+
+                print(
+                    "\nReached the week's assignment — "
+                    "no more lectures."
+                )
+
+                break
 
             # --------------------------------------------
             # Extract video
@@ -526,6 +559,12 @@ def enrich_job_with_videos(page, job):
                     )
                 }
             )
+
+        except NotLoggedInError:
+
+            # Not a lecture failure — every remaining lecture would
+            # hit the same logged-out page; abort without recording.
+            raise
 
         except Exception as e:
 
@@ -607,7 +646,7 @@ def enrich_jobs_with_videos(jobs):
                 user_data_dir=str(
                     BROWSER_PROFILE_DIR
                 ),
-                headless=False,
+                headless=HEADLESS,
                 viewport={
                     "width": 1400,
                     "height": 900
@@ -644,6 +683,10 @@ def enrich_jobs_with_videos(jobs):
                     enriched_jobs.append(
                         enriched_job
                     )
+
+                except NotLoggedInError:
+
+                    raise
 
                 except Exception as e:
 

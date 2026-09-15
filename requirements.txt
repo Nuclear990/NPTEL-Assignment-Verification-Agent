@@ -1,8 +1,19 @@
 playwright
-youtube-transcript-api
-openai
+yt-dlp
+PySocks
+groq
+langchain-text-splitters
 python-dotenv
-tenacity
+beautifulsoup4
+pillow
 google-api-python-client
 google-auth-httplib2
 google-auth-oauthlib
+sentence-transformers
+rank-bm25
+numpy
+faiss-cpu
+# torch: install the CPU wheel, not the default (CUDA) one:
+# pip install torch --index-url https://download.pytorch.org/whl/cpu
+torch
+transformers

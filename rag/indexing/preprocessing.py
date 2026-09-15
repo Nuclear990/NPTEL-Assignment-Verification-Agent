@@ -12,9 +12,10 @@ from rag.config import BASE_DIR
 INPUT_FILE = BASE_DIR / "sample.txt"
 OUTPUT_FILE = BASE_DIR / "sample_cleaned.txt"
 
-MAX_CHARS = 15000        # max raw chars per chunk sent to the model
-OVERLAP_SENTENCES = 0    # not used for raw overlap anymore — continuation is handled via last_section
+MAX_CHARS = 15000        # max raw chars per window sent to the model, overlap included
+OVERLAP_CHARS = 2000     # raw chars repeated from the previous window, as context only
 SLEEP_BETWEEN_CALLS = 2  # seconds, be gentle on TPM rate limits
+MAX_ATTEMPTS = 3         # per chunk, when the model returns empty or truncated output
 
 _client = None
 
@@ -54,7 +55,7 @@ Rules:
    - "### [sub-topic label]" for a chunk boundary *within* that topic. Insert a new
      "### " subheader at least every ~150-200 words of body text, even if the topic
      hasn't changed, at the nearest natural break (end of an example, end of an
-     argument, a new name/date/case being introduced). Never let more than ~220
+     argument, a new name/date/case being introduced). NEVER let more than ~220
      words of prose accumulate under one header without a "### " break.
 5. Each "### " subsection should be self-contained enough to be read on its own:
    if it relies on a pronoun or "this"/"that" referring to something introduced more
@@ -68,59 +69,31 @@ Rules:
    subheaders under it per rule 4 (do not repeat the "## " header or its content) —
    only start a new "## " header once the topic has genuinely moved on.
 Output only the cleaned, headered Markdown. No preamble, no commentary, no annotations in headers.
-REMEMBER: hard cap 260 words
+REMEMBER: do not drop any facts, names, numbers, information.
 """
 
 
 # ---------------------------------------------------------------------------
-# Sentence-aware chunk splitter
+# Character chunk splitter
 # ---------------------------------------------------------------------------
 
-def split_sentences(text: str) -> list[str]:
-    """Naive sentence splitter — splits on '.', '?', '!' followed by
-    whitespace and a capital letter/quote, while trying not to break on
-    common abbreviations. Good enough for cleaning purposes, not
-    linguistically perfect."""
-    protected = re.sub(
-        r'\b(Mr|Mrs|Ms|Dr|Prof|vs|etc|e\.g|i\.e|U\.S|U\.K)\.',
-        lambda m: m.group(0).replace('.', '<DOT>'),
-        text,
-    )
-    raw_sentences = re.split(r'(?<=[.!?])\s+(?=[A-Z"\'])', protected)
-    return [s.replace('<DOT>', '.').strip() for s in raw_sentences if s.strip()]
+def split_into_chunks(
+    text: str,
+    max_chars: int = MAX_CHARS,
+    overlap_chars: int = OVERLAP_CHARS
+) -> list[tuple[str, str]]:
+    """Splits text into windows of at most max_chars, each starting with the
+    previous window's last overlap_chars. Returns (overlap, new_text) pairs so
+    the overlap is shown to the model as context but never cleaned twice."""
 
+    chunks: list[tuple[str, str]] = []
+    new_start = 0
 
-def split_into_chunks(text: str, max_chars: int = 15000, overlap_sentences: int = 0) -> list[str]:
-    """Splits text into chunks of up to max_chars, breaking only at sentence
-    boundaries. overlap_sentences repeats the last N sentences of a chunk at
-    the start of the next one (set to 0 if using last-section continuation
-    instead of raw overlap)."""
-    sentences = split_sentences(text)
-    if not sentences:
-        return []
-
-    chunks: list[str] = []
-    current: list[str] = []
-    current_len = 0
-    i = 0
-
-    while i < len(sentences):
-        sentence = sentences[i]
-        sentence_len = len(sentence) + 1
-
-        if current_len + sentence_len > max_chars and current:
-            chunks.append(" ".join(current))
-            overlap = current[-overlap_sentences:] if overlap_sentences > 0 else []
-            current = list(overlap)
-            current_len = sum(len(s) + 1 for s in current)
-            continue
-
-        current.append(sentence)
-        current_len += sentence_len
-        i += 1
-
-    if current:
-        chunks.append(" ".join(current))
+    while new_start < len(text):
+        window_start = max(new_start - overlap_chars, 0)
+        window_end = min(window_start + max_chars, len(text))
+        chunks.append((text[window_start:new_start], text[new_start:window_end]))
+        new_start = window_end
 
     return chunks
 
@@ -144,7 +117,16 @@ def get_last_section(cleaned_text: str) -> str:
 # LLM cleaning call
 # ---------------------------------------------------------------------------
 
-def clean_chunk(chunk: str, last_section: str = "") -> tuple[str, dict]:
+def clean_chunk(chunk: str, last_section: str = "", overlap: str = "") -> tuple[str, dict]:
+    overlap_note = ""
+    if overlap:
+        overlap_note = (
+            f"The text below overlaps with the end of the previous chunk and has "
+            f"already been cleaned. Use it ONLY as context for where this chunk "
+            f"starts — do NOT clean it or include it in your output:\n"
+            f"\"\"\"\n{overlap}\n\"\"\"\n\n"
+        )
+
     context_note = ""
     if last_section:
         context_note = (
@@ -156,25 +138,42 @@ def clean_chunk(chunk: str, last_section: str = "") -> tuple[str, dict]:
             f"'## ' header once the topic genuinely shifts."
         )
 
-    user_content = f"Transcript chunk:\n{chunk}{context_note}"
+    user_content = f"{overlap_note}Transcript chunk:\n{chunk}{context_note}"
 
-    response = get_client().chat.completions.create(
-        model="openai/gpt-oss-120b",
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_content},
-        ],
-        reasoning_effort="medium",
-        temperature=0,
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+
+        response = get_client().chat.completions.create(
+            model="openai/gpt-oss-120b",
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_content},
+            ],
+            reasoning_effort="medium",
+            temperature=0,
+        )
+
+        choice = response.choices[0]
+        cleaned = choice.message.content or ""
+
+        # Reasoning models can burn the whole completion budget thinking and
+        # return empty/cut-off content; accepting it silently drops the chunk.
+        if cleaned.strip() and choice.finish_reason != "length":
+            usage = {
+                "prompt_tokens": response.usage.prompt_tokens if response.usage else None,
+                "completion_tokens": response.usage.completion_tokens if response.usage else None,
+                "total_tokens": response.usage.total_tokens if response.usage else None,
+            }
+            return cleaned, usage
+
+        problem = "truncated" if choice.finish_reason == "length" else "empty"
+        print(f"  attempt {attempt}/{MAX_ATTEMPTS}: model returned {problem} output")
+
+        if attempt < MAX_ATTEMPTS:
+            time.sleep(SLEEP_BETWEEN_CALLS)
+
+    raise RuntimeError(
+        f"Model returned empty/truncated output after {MAX_ATTEMPTS} attempts"
     )
-
-    cleaned = response.choices[0].message.content
-    usage = {
-        "prompt_tokens": response.usage.prompt_tokens if response.usage else None,
-        "completion_tokens": response.usage.completion_tokens if response.usage else None,
-        "total_tokens": response.usage.total_tokens if response.usage else None,
-    }
-    return cleaned, usage
 
 
 # ---------------------------------------------------------------------------
@@ -182,18 +181,19 @@ def clean_chunk(chunk: str, last_section: str = "") -> tuple[str, dict]:
 # ---------------------------------------------------------------------------
 
 def clean_transcript(text: str, max_chars: int = MAX_CHARS) -> str:
-    chunks = split_into_chunks(text, max_chars=max_chars, overlap_sentences=OVERLAP_SENTENCES)
+    chunks = split_into_chunks(text, max_chars=max_chars)
     print(f"Split into {len(chunks)} chunk(s)\n")
 
     cleaned_pieces: list[str] = []
     last_section = ""
     total_tokens = 0
 
-    for i, chunk in enumerate(chunks):
+    for i, (overlap, chunk) in enumerate(chunks):
         print(f"Cleaning chunk {i+1}/{len(chunks)} "
-              f"({len(chunk):,} chars, context: {len(last_section)} chars)...")
+              f"({len(chunk):,} new chars + {len(overlap):,} overlap, "
+              f"context: {len(last_section)} chars)...")
 
-        cleaned, usage = clean_chunk(chunk, last_section)
+        cleaned, usage = clean_chunk(chunk, last_section, overlap)
 
         if usage["total_tokens"]:
             total_tokens += usage["total_tokens"]
@@ -208,11 +208,6 @@ def clean_transcript(text: str, max_chars: int = MAX_CHARS) -> str:
             cleaned_pieces[-1] = cleaned_pieces[-1].rstrip() + "\n" + cleaned.lstrip()
 
         last_section = get_last_section(cleaned_pieces[-1])
-
-        # basic sanity check: warn if a chunk's cleaned output looks over-summarized
-        ratio = len(cleaned) / max(len(chunk), 1)
-        if ratio < 0.5:
-            print(f"  ⚠️  cleaned output is only {ratio:.0%} of input length — check for over-summarization")
 
         if i < len(chunks) - 1:
             time.sleep(SLEEP_BETWEEN_CALLS)

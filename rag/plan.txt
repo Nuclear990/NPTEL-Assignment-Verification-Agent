@@ -1,0 +1,267 @@
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ RAG embedding, storage, and retrieval (dense + sparse + RRF)
+
+ Context
+
+ rag/indexing/index.py currently cleans (LLM) and chunks each lecture transcript
+ per course+week, writing per-lecture .txt and .chunks.json files — but
+ nothing embeds or stores those chunks for search, and rag/retrieval/retrieval.py
+ is empty. The goal here is to close that gap: build a per-course-per-week
+ embedding index at indexing time, and a retrieval function that — given one
+ MCQ question with its options — returns a single combined string of the most
+ relevant transcript evidence, ready to hand to an LLM later (wiring that call
+ site is explicitly deferred; this task only builds the retrieval function
+ itself).
+
+ Everything must be free: local, CPU-only models, no paid APIs.
+
+ Decisions already made and confirmed with the user (final, not open questions):
+ - Retrieval scope: same course+week as the question only (no cross-week search).
+ - Vector storage: FAISS (faiss-cpu), exact flat index — free, local. (At this
+   corpus scale, ~20-200 chunks/week, a flat index performs like brute-force
+   numpy; FAISS was chosen anyway and that's fine.)
+ - Sparse (BM25): no persisted index — rebuilt in-memory from stored chunk text
+   each time a course+week store is loaded (cheap at this scale).
+ - Numbers: DENSE_TOP_K=5, BM25_TOP_K=5, new TOP_K_PER_OPTION=3, RRF_K=60
+   unchanged. No cross-encoder reranking step — RERANKER_MODEL_NAME/
+   RERANK_TOP_K stay in config but unused (deliberately deferred, not a gap).
+ - The new consolidated per-week store (store/ dir: index.faiss + row-aligned
+   chunks.json) coexists with the existing per-lecture .chunks.json files
+   — those are untouched.
+
+ Files to create/modify
+
+ ┌────────────────────────────┬────────────────────────────────────────────────────────────────────────┐
+ │            File            │                                 Action                                 │
+ ├────────────────────────────┼────────────────────────────────────────────────────────────────────────┤
+ │ rag/indexing/embedding.py  │ new — shared embedding function                                        │
+ ├────────────────────────────┼────────────────────────────────────────────────────────────────────────┤
+ │ rag/indexing/storage.py    │ fill in (currently empty) — FAISS+chunks.json persistence              │
+ ├────────────────────────────┼────────────────────────────────────────────────────────────────────────┤
+ │ rag/indexing/index.py      │ modify — build+save the consolidated store after the existing          │
+ │                            │ per-lecture loop                                                       │
+ ├────────────────────────────┼────────────────────────────────────────────────────────────────────────┤
+ │ rag/retrieval/retrieval.py │ fill in (currently empty) — the retrieval algorithm                    │
+ ├────────────────────────────┼────────────────────────────────────────────────────────────────────────┤
+ │ rag/config.py              │ modify — DENSE_TOP_K/BM25_TOP_K → 5, add TOP_K_PER_OPTION=3, remove    │
+ │                            │ FINAL_EVIDENCE_K (superseded, and grep-confirmed unused anywhere)      │
+ ├────────────────────────────┼────────────────────────────────────────────────────────────────────────┤
+ │ requirements.txt           │ modify — add sentence-transformers, rank-bm25, numpy, faiss-cpu, torch │
+ └────────────────────────────┴────────────────────────────────────────────────────────────────────────┘
+
+ rag/models.py stays untouched — not needed for this.
+
+ rag/config.py changes
+
+ DENSE_TOP_K = 5          # was 15
+ BM25_TOP_K = 5            # was 15
+ TOP_K_PER_OPTION = 3      # new
+ # RERANK_TOP_K / RERANKER_MODEL_NAME: unchanged, stay unused (deferred)
+ # RRF_K = 60: unchanged
+ # FINAL_EVIDENCE_K: removed (superseded by TOP_K_PER_OPTION; confirmed unused repo-wide)
+
+ rag/indexing/embedding.py (new)
+
+ Module-level lazily-loaded SentenceTransformer(EMBEDDING_MODEL_NAME) singleton.
+
+ def embed_texts(texts: list[str]) -> np.ndarray:
+     """
+     L2-normalized float32 vectors, shape (len(texts), dim), via
+     model.encode(texts, convert_to_numpy=True, normalize_embeddings=True).
+     Normalized so FAISS IndexFlatIP == cosine similarity.
+     Empty input -> empty (0, dim) array, no error.
+     Used identically by index.py (embedding chunks) and retrieval.py
+     (embedding "question + option" query strings) — same embedding space.
+     """
+
+ rag/indexing/storage.py (fill in)
+
+ Pure persistence — takes chunks + already-computed vectors, no model loading here.
+
+ def save_store(chunks: list[dict], vectors: np.ndarray, store_dir: Path) -> None:
+     """
+     store_dir/index.faiss <- faiss.IndexFlatIP(dim) built from vectors,
+         via faiss.write_index. index.add(vectors) preserves input order,
+         so FAISS row i <-> chunks[i].
+     store_dir/chunks.json <- json.dumps(chunks), row-aligned with the index.
+     mkdir(parents=True, exist_ok=True) on store_dir first.
+     Requires len(chunks) == vectors.shape[0].
+     """
+
+ def load_store(store_dir: Path) -> tuple[faiss.Index, list[dict]]:
+     """
+     faiss.read_index + json.load. Raises FileNotFoundError if either
+     file is missing (no store built yet for this course+week).
+     """
+
+ Consolidated store chunk schema (new — distinct from existing per-lecture .chunks.json, which is unchanged)
+
+ {
+   "chunk_id": "01_research_in_applied_mechanics::0",
+   "source_file": "01_research_in_applied_mechanics",
+   "chunk_index": 0,
+   "text": "...",
+   "topic": "...",
+   "subtopic": "...",
+   "word_count": 84
+ }
+
+ - source_file + chunk_index: reconstruct source order. Lecture filenames are
+   already zero-padded (f"{index:02d}_{slug}.txt", confirmed in
+   ingestion/transcripts.py:380), so sorting by source_file string is
+   correct lecture order.
+ - chunk_id: human-readable id for debugging/logging, not used for dedup.
+ - Dedup key = row index (position in chunks.json / FAISS row id) — already
+   exactly what dense and BM25 search both return, no id-translation needed.
+
+ rag/indexing/index.py modifications
+
+ The existing per-lecture loop (clean → write .txt; chunk → write
+ .chunks.json) is not touched. Add:
+
+ 1. Before the loop: all_chunks_for_store = [].
+ 2. Right after the existing chunks = chunk_cleaned_transcript(cleaned_text) /
+    chunk-writing block succeeds (same try/except scope, so a lecture that
+    fails chunking correctly contributes nothing — matches real observed data:
+    week_8 has 17 lecture .txt files but only 14 .chunks.json, 4 failed in
+    the original run): enumerate chunks, append each merged with
+    chunk_id=f"{lecture_file.stem}::{i}", source_file=lecture_file.stem,
+    chunk_index=i to all_chunks_for_store.
+ 3. After the full loop: if all_chunks_for_store is non-empty, wrapped in
+    try/except (matches this file's existing per-step error tolerance):
+    texts = [c["text"] for c in all_chunks_for_store],
+    vectors = embed_texts(texts), store_dir = out_dir / "store",
+    save_store(all_chunks_for_store, vectors, store_dir). On any exception or
+    empty input, print and set store_dir = None — don't fail the whole job.
+ 4. Add "store_dir": str(store_dir) if store_dir else None to the returned
+    dict (all existing keys stay).
+
+ New imports: from rag.indexing.embedding import embed_texts,
+ from rag.indexing.storage import save_store.
+
+ One job's folder_path already corresponds to exactly one course+week (per
+ ingestion/transcripts.py's send_to_rag_ingestion), so building the store
+ from all-chunks-in-this-job is correct — no cross-week mixing risk.
+
+ rag/retrieval/retrieval.py (fill in)
+
+ Two functions + a small session object — needed because BM25/FAISS must be
+ loaded once per course+week and reused across every option of every question,
+ not reloaded per call. No batch wrapper over a full questions.json payload —
+ wiring is deferred and that loop is trivial for a future caller to write.
+
+ @dataclass
+ class RetrievalSession:
+     course: str
+     week: str | int
+     faiss_index: faiss.Index
+     chunks: list[dict]     # chunks[i] <-> faiss_index row i
+     bm25: BM25Okapi         # built once from chunks' texts
+
+ def load_retrieval_session(course: str, week) -> RetrievalSession:
+     """Resolve store_dir = RAG_DIR/_slugify(course)/f"week_{week}"/"store",
+     load_store(), build BM25Okapi from chunk texts. Raises FileNotFoundError
+     if no store exists yet for this course+week."""
+
+ def retrieve_context_for_question(session: RetrievalSession, question: dict) -> str:
+     """
+     question = {"question": str, "options": [{"id","text"}, ...], ...}
+     (extra keys ignored).
+
+     For each option: query_text = question["question"] + " " + option["text"]
+       -> _top_chunks_for_query(query_text, session) -> top-3 row ids (post-RRF)
+     Union all options' top-3 sets, dedup by row id.
+     Sort deduped ids by (chunks[id]["source_file"], chunks[id]["chunk_index"]).
+     Return "\n\n".join(chunks[id]["text"] for id in ordered ids).
+     "" if no options or empty store.
+     """
+
+ def _top_chunks_for_query(query_text: str, session) -> list[int]:
+     """dense = _dense_search(query_text, session.faiss_index, DENSE_TOP_K)
+     sparse = _bm25_search(query_text, session.bm25, BM25_TOP_K)
+     return _rrf_fuse(dense, sparse)[:TOP_K_PER_OPTION]"""
+
+ def _dense_search(query_text, faiss_index, top_k) -> list[int]:
+     """embed_texts([query_text]) -> faiss_index.search(vec, top_k) ->
+     ids[0] with -1 padding filtered out (already rank-ordered by FAISS)."""
+
+ def _bm25_search(query_text, bm25, top_k) -> list[int]:
+     """_tokenize(query_text) -> bm25.get_scores() -> argsort desc ->
+     top min(top_k, n_docs) row indices."""
+
+ def _rrf_fuse(dense_ids, sparse_ids) -> list[int]:
+     """Per-list 1-indexed ranks; rrf_score(id) = sum of 1/(RRF_K+rank) over
+     each list containing id (0 if absent from a list). Sort all unique ids
+     by rrf_score desc. Ties broken by stable-sort/insertion order (dense
+     processed before sparse) — deterministic, good enough, not otherwise
+     specified."""
+
+ def _build_bm25(chunks) -> BM25Okapi:
+     """BM25Okapi([_tokenize(c["text"]) for c in chunks])"""
+
+ def _tokenize(text) -> list[str]:
+     """text.lower(); re.findall(r"[a-z0-9]+", text) — no stemming/stopwords,
+     matches this project's existing lightweight-regex style."""
+
+ def _slugify(text) -> str:
+     """Same as the _slugify already duplicated in index.py and
+     transcripts.py — kept as a third local copy, consistent with this
+     codebase's existing convention (not extracting a shared utils module)."""
+
+ Storage layout on disk
+
+ data/rag/<course_slug>/week_<n>/
+     01_lecture_a.txt              # existing, unchanged
+     01_lecture_a.chunks.json      # existing, unchanged
+     ...
+     store/                        # new, coexists
+         index.faiss
+         chunks.json
+
+ Dependencies
+
+ Missing from venv (confirmed via venv/bin/pip list): torch, faiss.
+ Already installed but unpinned in requirements.txt: sentence-transformers,
+ rank-bm25, numpy.
+
+ Manual one-time install (CPU-only torch, avoids pulling a multi-hundred-MB CUDA
+ wheel that this script will never use):
+ venv/bin/pip install torch --index-url https://download.pytorch.org/whl/cpu
+ venv/bin/pip install faiss-cpu
+
+ Add to requirements.txt (bare names, matching its existing no-pin style):
+ sentence-transformers, rank-bm25, numpy, faiss-cpu, torch (with a
+ comment above torch documenting the CPU-wheel install command, since a plain
+ pip install torch would pull the CUDA build).
+
+ scikit-learn is already installed but unused by any of this — not added.
+
+ Verification plan (using real data already on disk, no pytest needed)
+
+ 1. Install torch (CPU) + faiss-cpu as above.
+ 2. Build a real store for research_methodology week 8 directly from the
+    existing data/rag/research_methodology/week_8/*.chunks.json files
+    (14 of 17 lectures have them — 04_, 08_, 16_, 17_ don't, from a
+    prior partial failure; sorting by filename naturally skips the missing
+    ones in correct order) — via a throwaway scratch script that mimics
+    index.py's new logic (add chunk_id/source_file/chunk_index, call
+    embed_texts, call save_store). This avoids needing a Groq key/re-running
+    LLM cleaning.
+ 3. Load data/assignments/research_methodology/week_8/questions.json, take a
+    real question (e.g. elements[0]: "In order to pursue the research, which
+    of the following is priorly required?", 4 options about research design/
+    question/hypothesis/data-analysis).
+ 4. load_retrieval_session("Research Methodology", 8) — confirm
+    _slugify("Research Methodology") == "research_methodology" matches the
+    real folder.
+ 5. retrieve_context_for_question(session, elements[0]) — print the result,
+    eyeball that it's plausibly about the research process, not unrelated
+    lecture content (e.g. the intro/bio chunk from lecture 01 shouldn't
+    dominate this particular question).
+ 6. Confirm ordering (earlier lecture numbers first, ascending chunk_index
+    within a lecture) and dedup (no repeated chunk text) by inspection.
+ 7. Note as a known edge case (not necessarily exercised): a week with fewer
+    than 5 total chunks — _dense_search/_bm25_search must degrade
+    gracefully (FAISS -1 filtering, min(top_k, n_docs)), not error.
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+

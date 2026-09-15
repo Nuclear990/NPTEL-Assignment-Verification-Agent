@@ -698,7 +698,7 @@ def classify_assignment(
     )
 
     print(
-        f"\nAssignment file:"
+        "\nAssignment file:"
     )
 
     print(

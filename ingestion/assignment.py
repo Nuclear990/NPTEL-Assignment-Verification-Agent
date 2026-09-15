@@ -2,7 +2,7 @@ import os
 import re
 import json
 import time
-import requests
+import mimetypes
 
 from ingestion.img_to_txt import image_to_text
 
@@ -10,14 +10,15 @@ from urllib.parse import urlparse, parse_qs
 
 from playwright.sync_api import sync_playwright
 
-from config import BROWSER_PROFILE_DIR
+from auth.setup_login import assert_logged_in
+from config import BROWSER_PROFILE_DIR, DATA_DIR, HEADLESS
 
 
 # ================================================================
 # CONFIGURATION
 # ================================================================
 
-ASSIGNMENTS_DIR = "data/assignments"
+ASSIGNMENTS_DIR = DATA_DIR / "assignments"
 
 PAGE_LOAD_TIMEOUT = 30000
 QUESTION_WAIT_TIMEOUT = 30000
@@ -29,9 +30,6 @@ QUESTION_WAIT_TIMEOUT = 30000
 
 def slugify(text: str):
     """Convert course name into filesystem-safe format."""
-
-    if not text:
-        return "unknown"
 
     text = text.lower()
     text = re.sub(r"[^a-z0-9]+", "_", text)
@@ -131,7 +129,7 @@ def launch_browser(playwright):
         playwright.chromium
         .launch_persistent_context(
             user_data_dir=str(BROWSER_PROFILE_DIR),
-            headless=False,
+            headless=HEADLESS,
             viewport={
                 "width": 1400,
                 "height": 900
@@ -276,21 +274,23 @@ def extract_questions_from_page(
                             .filter(Boolean)
                         : [];
 
+                    // (?!\d) keeps decimals like "2.5 kg" intact.
                     questionText = questionText.replace(
-                        /^\s*\d+\s*[.\)]\s*/,
+                        /^\s*\d+\s*[.\)](?!\d)\s*/,
                         ""
                     );
 
                     const options = [];
 
-                    Array.from(
-                        section.querySelectorAll("label")
-                    ).forEach(label => {
-                        const input = label.querySelector(
-                            'input[type="radio"], input[type="checkbox"]'
-                        );
+                    inputs.forEach(input => {
+                        const label = input.closest("label")
+                            || (input.id
+                                ? section.querySelector(
+                                    `label[for="${CSS.escape(input.id)}"]`
+                                )
+                                : null);
 
-                        if (!input) {
+                        if (!label) {
                             return;
                         }
 
@@ -398,39 +398,43 @@ def extract_questions_from_page(
             []
         )
 
-        if not image_urls:
-            continue
-
-        image_dir = os.path.join(
-            ASSIGNMENTS_DIR,
-            slugify(course),
-            f"week_{week}",
-            "images",
-            element["id"]
-        )
-
-        os.makedirs(
-            image_dir,
-            exist_ok=True
-        )
-
         image_paths = []
-        descriptions = []
 
         for image_index, image_url in enumerate(
             image_urls,
             start=1
         ):
             try:
-                response = requests.get(
+                # page.request shares the logged-in browser
+                # context's cookies, so auth-gated images load.
+                response = page.request.get(
                     image_url,
-                    timeout=20
+                    timeout=20000
                 )
-                response.raise_for_status()
+
+                if not response.ok:
+                    raise RuntimeError(
+                        f"HTTP {response.status}"
+                    )
+
+                content_type = (
+                    response.headers.get("content-type", "")
+                    .split(";")[0]
+                    .strip()
+                )
+
+                extension = (
+                    mimetypes.guess_extension(content_type)
+                    or ".png"
+                )
 
                 image_path = os.path.join(
-                    image_dir,
-                    f"image_{image_index}.png"
+                    build_question_image_directory(
+                        course,
+                        week,
+                        element["id"]
+                    ),
+                    f"image_{image_index}{extension}"
                 )
 
                 with open(
@@ -438,7 +442,7 @@ def extract_questions_from_page(
                     "wb"
                 ) as image_file:
                     image_file.write(
-                        response.content
+                        response.body()
                     )
 
                 image_paths.append(
@@ -449,20 +453,21 @@ def extract_questions_from_page(
                     f"  Image saved: {image_path}"
                 )
 
-
                 description = image_to_text(
                     image_path
                 )
-                element["question"] += str(description)
-     
+
+                if description:
+                    element["question"] += (
+                        f"\n\n[Image {image_index}]\n{description}"
+                    )
+
             except Exception as exc:
                 print(
                     f"  WARNING: Image processing failed "
                     f"for {element['id']}: {exc}"
                 )
-            
 
-  
         element["question_images"] = image_paths
 
     return elements
@@ -580,14 +585,7 @@ def extract_assignment(
                 page.url
             )
 
-            if (
-                "login" in page.url.lower()
-                or
-                "signin" in page.url.lower()
-            ):
-                raise RuntimeError(
-                    "NPTEL authentication required."
-                )
+            assert_logged_in(page)
 
             elements = extract_questions_from_page(
                 page=page,
@@ -743,6 +741,50 @@ def enrich_jobs_with_assignments(jobs):
         )
 
     return enriched_jobs
+
+
+# ================================================================
+# ENSURE ONE ASSIGNMENT IS SCRAPED (SKIP IF ALREADY ON DISK)
+# ================================================================
+
+def ensure_assignment_scraped(
+    course: str,
+    week,
+    assignment_url: str = None
+) -> str:
+    """
+    Scrape the assignment for course + week only if questions.json
+    doesn't already exist on disk. Returns the questions.json path
+    either way.
+    """
+
+    questions_file = build_questions_file_path(course, week)
+
+    if os.path.exists(questions_file):
+
+        print(
+            f"Assignment already scraped -> {questions_file}"
+        )
+
+        return questions_file
+
+    if not assignment_url:
+
+        raise ValueError(
+            "No assignment_url available to scrape this assignment."
+        )
+
+    assignment = extract_assignment(
+        assignment_url=assignment_url,
+        course=course,
+        week=week
+    )
+
+    return save_assignment_elements(
+        elements=assignment["elements"],
+        course=course,
+        week=week
+    )
 
 
 # ================================================================

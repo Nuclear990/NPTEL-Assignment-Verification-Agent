@@ -1,15 +1,18 @@
+import io
 import os
 import base64
+import math
 import mimetypes
 
 from groq import Groq
+from PIL import Image, UnidentifiedImageError
 
 
 # ================================================================
 # CONFIG
 # ================================================================
 
-MODEL = "qwen/qwen3.6-27b"
+MODEL = "qwen/qwen3.8-27b"
 
 '''IMAGE_PATH = (
     "/home/catpuccino/Desktop/nptel-agent/"
@@ -27,11 +30,57 @@ TEMPERATURE = 0
 # IMAGE
 # ================================================================
 
+MAX_ASPECT_RATIO = 2.0
+
+
+def _pad_wide_image(image_bytes):
+    """
+    Return PNG bytes of the image padded with white (top and bottom,
+    original centred) to MAX_ASPECT_RATIO, or None if the image is
+    not wider than that or can't be decoded (sent as-is then).
+
+    Very wide, short images — e.g. one line of question text — made
+    qwen/qwen3.8-27b invent "enlarged crops" and misread symbols (α as
+    "a"); padding to 2:1 fixed both in testing and halves image tokens.
+    """
+
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as image:
+            width, height = image.size
+
+            if width <= height * MAX_ASPECT_RATIO:
+                return None
+
+            rgba = image.convert("RGBA")
+
+    except (UnidentifiedImageError, OSError):
+        return None
+
+    canvas = Image.new(
+        "RGB",
+        (width, math.ceil(width / MAX_ASPECT_RATIO)),
+        "white"
+    )
+
+    canvas.paste(
+        rgba,
+        (0, (canvas.height - height) // 2),
+        rgba
+    )
+
+    buffer = io.BytesIO()
+    canvas.save(buffer, format="PNG")
+
+    return buffer.getvalue()
+
+
 def encode_image(image_path):
     """
     Read the complete image from disk and return:
 
         (mime_type, base64_data)
+
+    Images wider than MAX_ASPECT_RATIO are padded first and sent as PNG.
     """
 
     if not os.path.isfile(image_path):
@@ -60,6 +109,13 @@ def encode_image(image_path):
         raise ValueError(
             f"Image file is empty: {image_path}"
         )
+
+    padded_bytes = _pad_wide_image(image_bytes)
+
+    if padded_bytes is not None:
+
+        image_bytes = padded_bytes
+        mime_type = "image/png"
 
     encoded_image = base64.b64encode(
         image_bytes
@@ -345,4 +401,5 @@ def image_to_text(IMAGE_PATH):
 # ================================================================
 
 if __name__ == "__main__":
-    image_to_text()
+    import sys
+    image_to_text(sys.argv[1])
