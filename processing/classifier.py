@@ -3,16 +3,27 @@ import json
 import time
 from pathlib import Path
 
-from groq import Groq
+from groq import Groq, RateLimitError
+
+from ingestion.assignment import build_questions_file_path
 
 
 # ================================================================
 # CONFIG
 # ================================================================
 
-MODEL = "openai/gpt-oss-120b"
+MODEL = "openai/gpt-oss-20b"
 
-JOB_DELAY_SECONDS = 65
+# In testing, gpt-oss-20b in JSON mode failed every call on an
+# assignment with passages at default/high reasoning effort (400
+# json_validate_failed, empty output); "low" classified it correctly.
+REASONING_EFFORT = "low"
+
+# A rate limit asking to retry within this many seconds is the
+# per-minute token limit — wait it out. A longer one is the daily
+# quota: block classification for the rest of this run.
+MAX_RATE_LIMIT_WAIT_SECONDS = 90
+MAX_RATE_LIMIT_WAITS = 5
 
 
 # ================================================================
@@ -42,6 +53,109 @@ def get_groq_client():
 
 
 # ================================================================
+# CROSS-JOB CLASSIFICATION BLOCKING
+# ================================================================
+#
+# A rate limit that can't be waited out (the daily quota) is
+# systemic for this run, the same way it is for cleaning (see
+# rag/indexing/index.py's is_cleaning_blocked): every job after
+# this one would hit it again. Separate from the solver's flag —
+# the classifier runs on gpt-oss-20b and the solver on
+# gpt-oss-120b, and Groq rate limits each model separately.
+#
+
+_classification_blocked = False
+
+
+def is_classification_blocked() -> bool:
+
+    return _classification_blocked
+
+
+def _block_classification(reason: str) -> None:
+
+    global _classification_blocked
+
+    if not _classification_blocked:
+
+        print(
+            f"\n🚫 Blocking further classification for the rest of "
+            f"this run: {reason}"
+        )
+
+    _classification_blocked = True
+
+
+def _retry_after_seconds(error: RateLimitError) -> float:
+
+    try:
+
+        return float(error.response.headers.get("retry-after"))
+
+    except (TypeError, ValueError):
+
+        return 60.0
+
+
+def _create_completion(client, prompt):
+    """
+    The classification call, waiting out short (per-minute) rate
+    limits. A long (daily) rate limit, or too many waits, blocks
+    classification for the rest of this run and is re-raised.
+    """
+
+    waits = 0
+
+    while True:
+
+        try:
+
+            return client.chat.completions.create(
+
+                model=MODEL,
+
+                messages=[
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ],
+
+                temperature=0,
+
+                reasoning_effort=REASONING_EFFORT,
+
+                response_format={
+                    "type": "json_object"
+                }
+            )
+
+        except RateLimitError as e:
+
+            retry_after = _retry_after_seconds(e)
+
+            if (
+                retry_after > MAX_RATE_LIMIT_WAIT_SECONDS
+                or waits >= MAX_RATE_LIMIT_WAITS
+            ):
+
+                _block_classification(
+                    f"{type(e).__name__}: {e}"
+                )
+
+                raise
+
+            waits += 1
+
+            print(
+                f"Rate limited — waiting {retry_after:.0f}s "
+                f"({waits}/{MAX_RATE_LIMIT_WAITS})"
+            )
+
+            time.sleep(retry_after)
+
+
+# ================================================================
 # FILE LOADING
 # ================================================================
 
@@ -68,11 +182,13 @@ def load_assignment(
                     "solving_strategy": null
                 },
                 "question": "...",
-                "options": [...],
-                "passage_id": ""
+                "options": [...]
             }
         ]
     }
+
+    Questions carry no passage_id until classification adds one to
+    those classified as passage questions.
     """
 
     path = Path(
@@ -788,22 +904,9 @@ def classify_assignment(
         "in ONE request..."
     )
 
-    response = client.chat.completions.create(
-
-        model=MODEL,
-
-        messages=[
-            {
-                "role": "user",
-                "content": prompt
-            }
-        ],
-
-        temperature=0,
-
-        response_format={
-            "type": "json_object"
-        }
+    response = _create_completion(
+        client,
+        prompt
     )
     usage = response.usage
 
@@ -924,153 +1027,6 @@ def classify_assignment(
 
 
 # ================================================================
-# CLASSIFY MULTIPLE JOBS
-# ================================================================
-
-def classify_jobs(
-    jobs
-):
-    """
-    Classify multiple assignment jobs.
-
-    Important:
-
-    - ONE LLM call per assignment
-    - Wait 65 seconds between jobs
-    - Last job does not wait
-    """
-
-    if not jobs:
-
-        print(
-            "\nNo jobs provided to classifier."
-        )
-
-        return []
-
-    client = get_groq_client()
-
-    classified_jobs = []
-
-    total_jobs = len(
-        jobs
-    )
-
-    for index, job in enumerate(
-        jobs,
-        start=1
-    ):
-
-        print(
-            "\n"
-        )
-
-        print(
-            "#" * 80
-        )
-
-        print(
-            f"CLASSIFIER JOB "
-            f"{index}/{total_jobs}"
-        )
-
-        print(
-            "#" * 80
-        )
-
-        try:
-
-            classifications = (
-                classify_assignment(
-                    assignment_file=
-                        job["assignment_file"],
-
-                    client=
-                        client
-                )
-            )
-
-            classified_job = (
-                job.copy()
-            )
-
-            classified_job[
-                "classification_file"
-            ] = str(
-                get_classification_file_path(
-                    job["assignment_file"]
-                )
-            )
-
-            classified_job[
-                "classification_summary"
-            ] = {
-
-                "total_questions":
-                    len(classifications),
-
-                "model":
-                    MODEL
-            }
-
-            classified_jobs.append(
-                classified_job
-            )
-
-            print(
-                "\n✓ JOB CLASSIFIED SUCCESSFULLY"
-            )
-
-        except Exception as e:
-
-            print(
-                "\n✗ CLASSIFIER FAILED"
-            )
-
-            print(
-                f"{type(e).__name__}: {e}"
-            )
-
-            failed_job = (
-                job.copy()
-            )
-
-            failed_job[
-                "classifier_error"
-            ] = (
-                f"{type(e).__name__}: {e}"
-            )
-
-            classified_jobs.append(
-                failed_job
-            )
-
-        # --------------------------------------------------------
-        # Wait before next job
-        # --------------------------------------------------------
-
-        if index < total_jobs:
-
-            print(
-                "\n" + "-" * 80
-            )
-
-            print(
-                f"Waiting {JOB_DELAY_SECONDS} seconds "
-                f"before next job..."
-            )
-
-            print(
-                "-" * 80
-            )
-
-            time.sleep(
-                JOB_DELAY_SECONDS
-            )
-
-    return classified_jobs
-
-# ================================================================
 # ASSIGN CLASSIFICATIONS TO QUESTIONS
 # ================================================================
 
@@ -1084,7 +1040,8 @@ def assign_classification(
     For every question:
 
     - question_type.solving_strategy is updated
-    - passage_id is updated for passage questions
+    - passage_id is set only on passage questions (and removed
+      from any other question)
 
     Example:
 
@@ -1188,9 +1145,10 @@ def assign_classification(
 
         else:
 
-            element[
-                "passage_id"
-            ] = ""
+            element.pop(
+                "passage_id",
+                None
+            )
 
     # ------------------------------------------------------------
     # Save updated questions.json
@@ -1218,27 +1176,72 @@ def assign_classification(
     )
 
     return assignment
+
+
 # ================================================================
-# TEST
+# ENSURE ONE ASSIGNMENT IS CLASSIFIED (SKIP IF ALREADY DONE)
 # ================================================================
 
-if __name__ == "__main__":
+def ensure_assignment_classified(
+    course: str,
+    week
+):
+    """
+    Classify course + week's questions.json unless every question
+    in it already has a solving_strategy. Returns the
+    classifications, or None when the assignment isn't scraped yet,
+    was already classified, or classification is blocked for this
+    run by a rate limit.
+    """
 
-    TEST_JOB = {
+    if is_classification_blocked():
 
-        "course":
-            "Advanced Algorithmic Trading and Portfolio Management",
+        print(
+            "\nClassification is blocked for the rest of this run — "
+            "skipping."
+        )
 
-        "week":
-            5,
+        return None
 
-        "assignment_file":
-            "data/assignments/"
-            "advanced_algorithmic_trading_and_portfolio_management/"
-            "week_5/"
-            "questions.json"
-    }
-
-    classify_jobs(
-        [TEST_JOB]
+    assignment_file = build_questions_file_path(
+        course,
+        week
     )
+
+    if not os.path.exists(assignment_file):
+
+        print(
+            "\nAssignment not scraped yet — skipping classification."
+        )
+
+        return None
+
+    elements = load_assignment(
+        assignment_file
+    )["elements"]
+
+    already_classified = all(
+        element.get("question_type", {}).get("solving_strategy")
+        for element in elements
+        if element.get("element") == "question"
+    )
+
+    if already_classified:
+
+        print(
+            f"Assignment already classified -> {assignment_file}"
+        )
+
+        return None
+
+    try:
+
+        return classify_assignment(
+            assignment_file
+        )
+
+    except RateLimitError:
+
+        # Classification is now blocked for the rest of this run
+        # (see _create_completion) — retried on a later run.
+        return None

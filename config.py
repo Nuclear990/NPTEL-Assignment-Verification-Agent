@@ -9,7 +9,6 @@ AUTH_DIR = BASE_DIR / "auth"
 
 BROWSER_PROFILE_DIR = AUTH_DIR / "browser_profile"
 DATA_DIR = BASE_DIR / "data"
-SCREENSHOTS_DIR = BASE_DIR / "screenshots"
 
 CREDENTIALS_FILE = AUTH_DIR / "credentials.json"
 TOKEN_FILE = AUTH_DIR / "token.json"

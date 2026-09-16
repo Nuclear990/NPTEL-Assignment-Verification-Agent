@@ -23,8 +23,8 @@
  - Sparse (BM25): no persisted index — rebuilt in-memory from stored chunk text
    each time a course+week store is loaded (cheap at this scale).
  - Numbers: DENSE_TOP_K=5, BM25_TOP_K=5, new TOP_K_PER_OPTION=3, RRF_K=60
-   unchanged. No cross-encoder reranking step — RERANKER_MODEL_NAME/
-   RERANK_TOP_K stay in config but unused (deliberately deferred, not a gap).
+   unchanged. No cross-encoder reranking step — deliberately deferred, not a gap
+   (the unused RERANKER_MODEL_NAME/RERANK_TOP_K config was later removed).
  - The new consolidated per-week store (store/ dir: index.faiss + row-aligned
    chunks.json) coexists with the existing per-lecture .chunks.json files
    — those are untouched.
@@ -49,14 +49,14 @@
  │ requirements.txt           │ modify — add sentence-transformers, rank-bm25, numpy, faiss-cpu, torch │
  └────────────────────────────┴────────────────────────────────────────────────────────────────────────┘
 
- rag/models.py stays untouched — not needed for this.
+ rag/models.py was not needed for this (it was empty; later deleted).
 
  rag/config.py changes
 
  DENSE_TOP_K = 5          # was 15
  BM25_TOP_K = 5            # was 15
  TOP_K_PER_OPTION = 3      # new
- # RERANK_TOP_K / RERANKER_MODEL_NAME: unchanged, stay unused (deferred)
+ # RERANK_TOP_K / RERANKER_MODEL_NAME: unused (deferred; later removed)
  # RRF_K = 60: unchanged
  # FINAL_EVIDENCE_K: removed (superseded by TOP_K_PER_OPTION; confirmed unused repo-wide)
 
@@ -130,7 +130,7 @@
  3. After the full loop: if all_chunks_for_store is non-empty, wrapped in
     try/except (matches this file's existing per-step error tolerance):
     texts = [c["text"] for c in all_chunks_for_store],
-    vectors = embed_texts(texts), store_dir = out_dir / "store",
+    vectors = embed_texts(texts), store_dir = chunks_dir / "store",
     save_store(all_chunks_for_store, vectors, store_dir). On any exception or
     empty input, print and set store_dir = None — don't fail the whole job.
  4. Add "store_dir": str(store_dir) if store_dir else None to the returned
@@ -159,7 +159,7 @@
      bm25: BM25Okapi         # built once from chunks' texts
 
  def load_retrieval_session(course: str, week) -> RetrievalSession:
-     """Resolve store_dir = RAG_DIR/_slugify(course)/f"week_{week}"/"store",
+     """Resolve store_dir = CHUNKS_DIR/_slugify(course)/f"week_{week}"/"store",
      load_store(), build BM25Okapi from chunk texts. Raises FileNotFoundError
      if no store exists yet for this course+week."""
 
@@ -208,13 +208,16 @@
      transcripts.py — kept as a third local copy, consistent with this
      codebase's existing convention (not extracting a shared utils module)."""
 
- Storage layout on disk
+ Storage layout on disk (chunks + store were later moved out of data/rag/
+ into the separate CHUNKS_DIR)
 
  data/rag/<course_slug>/week_<n>/
-     01_lecture_a.txt              # existing, unchanged
-     01_lecture_a.chunks.json      # existing, unchanged
+     01_lecture_a.txt              # cleaned transcript
      ...
-     store/                        # new, coexists
+ data/chunks/<course_slug>/week_<n>/
+     01_lecture_a.chunks.json      # per-lecture chunks
+     ...
+     store/                        # consolidated store
          index.faiss
          chunks.json
 

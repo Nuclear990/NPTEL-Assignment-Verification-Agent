@@ -14,13 +14,6 @@ from PIL import Image, UnidentifiedImageError
 
 MODEL = "qwen/qwen3.8-27b"
 
-'''IMAGE_PATH = (
-    "/home/catpuccino/Desktop/nptel-agent/"
-    "data/assignments/"
-    "advanced_algorithmic_trading_and_portfolio_management/"
-    "week_5/images/q5/image_1.png"
-)
-'''
 MAX_COMPLETION_TOKENS = 1000
 
 TEMPERATURE = 0
@@ -258,141 +251,20 @@ def describe_image(
 
 
 # ================================================================
-# OUTPUT
-# ================================================================
-
-def print_response(
-    response
-):
-    """Print model output and token usage."""
-
-    message = response.choices[0].message
-
-    print("\n")
-    print("=" * 80)
-    print("MODEL DESCRIPTION")
-    print("=" * 80)
-
-    print()
-
-    print(
-        message.content
-    )
-
-    # ------------------------------------------------------------
-    # Finish reason
-    # ------------------------------------------------------------
-
-    print("\n")
-    print("=" * 80)
-    print("RESPONSE INFO")
-    print("=" * 80)
-
-    print(
-        f"Finish reason: {response.choices[0].finish_reason}"
-    )
-
-    # ------------------------------------------------------------
-    # Token usage
-    # ------------------------------------------------------------
-
-    usage = response.usage
-
-    print("\n")
-    print("=" * 80)
-    print("TOKEN USAGE")
-    print("=" * 80)
-
-    print(
-        f"Output token limit: {MAX_COMPLETION_TOKENS:,}"
-    )
-
-    print(
-        f"Prompt tokens:      {usage.prompt_tokens:,}"
-    )
-
-    print(
-        f"Completion tokens:  {usage.completion_tokens:,}"
-    )
-
-    print(
-        f"Total tokens:       {usage.total_tokens:,}"
-    )
-
-
-# ================================================================
 # MAIN
 # ================================================================
 
-def image_to_text(IMAGE_PATH):
-
-    print("=" * 80)
-    print("QWEN VISION TEST")
-    print("=" * 80)
-
-    print(
-        f"\nModel: {MODEL}"
-    )
-
-    print(
-        f"Image: {IMAGE_PATH}"
-    )
-
-    if not os.path.isfile(IMAGE_PATH):
-        raise FileNotFoundError(
-            f"Image not found: {IMAGE_PATH}"
-        )
-
-    image_size = os.path.getsize(
-        IMAGE_PATH
-    )
-
-    print(
-        f"Image size: {image_size:,} bytes"
-    )
-
-    print(
-        f"Output token limit: "
-        f"{MAX_COMPLETION_TOKENS:,}"
-    )
-
-    print(
-        f"Temperature: {TEMPERATURE}"
-    )
-
-    print("\nReading complete image...")
-
-    mime_type, base64_image = encode_image(
-        IMAGE_PATH
-    )
-
-    print(
-        f"MIME type: {mime_type}"
-    )
-
-    print(
-        f"Encoded image size: "
-        f"{len(base64_image):,} characters"
-    )
-
-    print(
-        "\nCreating Groq client..."
-    )
-
-    client = get_client()
-
-    print(
-        "Sending complete image to Qwen..."
-    )
+def image_to_text(image_path):
+    """
+    Return the vision model's text description of the image at
+    image_path.
+    """
 
     response = describe_image(
-        client=client,
-        image_path=IMAGE_PATH
+        client=get_client(),
+        image_path=image_path
     )
 
-    print_response(
-        response
-    )
     return response.choices[0].message.content
 
 
@@ -402,4 +274,4 @@ def image_to_text(IMAGE_PATH):
 
 if __name__ == "__main__":
     import sys
-    image_to_text(sys.argv[1])
+    print(image_to_text(sys.argv[1]))

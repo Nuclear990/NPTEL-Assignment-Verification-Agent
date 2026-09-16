@@ -261,9 +261,8 @@ def mark_transcript_cleaned(course: str, week, video_number: int) -> None:
 
 def mark_completed(course: str, week, completed: bool = True) -> None:
     """
-    Set the completed flag for course + week. Nothing in the
-    pipeline calls this yet — there is no solver to actually finish
-    a job — but it's here for whenever that step exists.
+    Set the completed flag for course + week. main.py sets it once
+    processing/solver.py has answered every question.
     """
 
     jobs = load_jobs()

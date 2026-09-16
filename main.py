@@ -13,9 +13,10 @@ from ingestion.transcripts import (
     save_week_transcripts
 )
 from ingestion.assignment import ensure_assignment_scraped
-from jobs import ensure_job, find_job, load_jobs
+from jobs import ensure_job, find_job, load_jobs, mark_completed
 from auth.setup_login import NotLoggedInError, setup_login
-#from solver import solve_job
+from processing.classifier import ensure_assignment_classified
+from processing.solver import solve_assignment
 
 # ================================================================
 # CONFIG
@@ -151,7 +152,8 @@ def register_new_jobs(emails):
 # PROCESS ONE JOB END TO END
 #
 # fetch remaining transcripts -> clean remaining transcripts
-#   -> if fully cleaned: embed + store, then solve
+#   -> scrape + classify assignment
+#   -> if fully cleaned: solve, then mark completed
 # ================================================================
 
 def process_job(job_record):
@@ -359,6 +361,29 @@ def process_job(job_record):
             )
 
     # --------------------------------------------------------
+    # Classification — once questions.json exists. Needs no
+    # browser, so it runs even when login isn't verified; skipped
+    # when every question already has a solving strategy.
+    # --------------------------------------------------------
+
+    try:
+
+        ensure_assignment_classified(
+            course,
+            week
+        )
+
+    except Exception as e:
+
+        print("\n" + "!" * 80)
+        print("CLASSIFICATION STEP FAILED")
+        print("!" * 80)
+
+        print(
+            f"{type(e).__name__}: {e}"
+        )
+
+    # --------------------------------------------------------
     # Solving — gated on every lecture for this week being
     # cleaned. Embedding + storage already happened above, as
     # part of the transcript-cleaning hand-off (see
@@ -386,12 +411,42 @@ def process_job(job_record):
         "\nAll transcripts cleaned for this week — ready to solve."
     )
 
-    # TODO: no solver module yet (main.py used to import
-    # `solve_jobs` from one that was never written). Once it
-    # exists, call it here and then mark_completed(course, week).
-    print(
-        "Solver not implemented yet — skipping."
-    )
+    try:
+
+        solved = solve_assignment(
+            course,
+            week
+        )
+
+    except Exception as e:
+
+        print("\n" + "!" * 80)
+        print("SOLVING STEP FAILED")
+        print("!" * 80)
+
+        print(
+            f"{type(e).__name__}: {e}"
+        )
+
+        return
+
+    if solved:
+
+        mark_completed(
+            course,
+            week
+        )
+
+        print(
+            "\n✓ Every question answered — job marked completed."
+        )
+
+    else:
+
+        print(
+            "\nSome questions are still unanswered — "
+            "they'll be retried next run."
+        )
 
 
 # ================================================================

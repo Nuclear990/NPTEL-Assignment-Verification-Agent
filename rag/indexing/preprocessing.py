@@ -3,14 +3,9 @@ import re
 import time
 from groq import Groq
 
-from rag.config import BASE_DIR
-
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-
-INPUT_FILE = BASE_DIR / "sample.txt"
-OUTPUT_FILE = BASE_DIR / "sample_cleaned.txt"
 
 MAX_CHARS = 15000        # max raw chars per window sent to the model, overlap included
 OVERLAP_CHARS = 2000     # raw chars repeated from the previous window, as context only
@@ -214,18 +209,3 @@ def clean_transcript(text: str, max_chars: int = MAX_CHARS) -> str:
 
     print(f"\nTotal tokens used across all chunks: {total_tokens:,}")
     return "\n\n".join(cleaned_pieces)
-
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
-
-if __name__ == "__main__":
-    raw_text = INPUT_FILE.read_text(encoding="utf-8")
-    cleaned_text = clean_transcript(raw_text)
-
-    OUTPUT_FILE.write_text(cleaned_text, encoding="utf-8")
-
-    print(f"\nSaved cleaned transcript to: {OUTPUT_FILE}")
-    print(f"Input characters:  {len(raw_text):,}")
-    print(f"Output characters: {len(cleaned_text):,}")
